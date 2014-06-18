@@ -1,3 +1,120 @@
+heat_template_version: 2013-05-23
+description: AutoScaling Wordpress
+parameters:
+  image:
+    type: string
+    description: Image used for servers
+  key_name:
+    type: string
+    description: SSH key to connect to the servers
+  flavor:
+    type: string
+    description: flavor used by the web servers
+  autoscaleserver_flavor:
+    type: string
+    description: flavor used by the autoscaleserver server
+  subnet_id:
+    type: string
+    description: subnet on which the load balancer will be located
+  database_name:
+    type: string
+    description: Name of the wordpress autoscaleserver
+    default: wordpress
+  database_user:
+    type: string
+    description: Name of the wordpress user
+    default: wordpress
+resources:
+  database_password:
+    type: OS::Heat::RandomString
+  database_root_password:
+    type: OS::Heat::RandomString
+  autoscaleserver:
+    type: OS::Nova::Server
+    properties:
+      flavor: {get_param: autoscaleserver_flavor}
+      image: {get_param: image}
+      key_name: {get_param: key_name}
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash -v
+            yum -y install mariadb mariadb-server
+            systemctl enable mariadb.service
+            systemctl start mariadb.service
+            mysqladmin -u root password $autoscaleserver_rootpassword
+            cat << EOF | mysql -u root --password=$autoscaleserver_rootpassword
+            CREATE DATABASE $autoscaleserver_name;
+            GRANT ALL PRIVILEGES ON $autoscaleserver_name.* TO "$autoscaleserver_user"@"%"
+            IDENTIFIED BY "$autoscaleserver_password";
+            FLUSH PRIVILEGES;
+            EXIT
+            EOF
+          params:
+            $autoscaleserver_rootpassword: {get_attr: [database_root_password, value]}
+            $autoscaleserver_name: {get_param: database_name}
+            $autoscaleserver_user: {get_param: database_user}
+            $autoscaleserver_password: {get_attr: [database_password, value]}
+  web_server_group:
+    type: OS::Heat::AutoScalingGroup
+    properties:
+      min_size: 1
+      max_size: 3
+      resource:
+        type: lb_server.yaml
+        properties:
+          flavor: {get_param: flavor}
+          image: {get_param: image}
+          key_name: {get_param: key_name}
+          pool_id: {get_resource: pool}
+          metadata: {"metering.stack": {get_param: "OS::stack_id"}}
+          user_data:
+            str_replace:
+              template: |
+                #!/bin/bash -v
+                yum -y install httpd wordpress
+                systemctl enable httpd.service
+                systemctl start httpd.service
+                setsebool -P httpd_can_network_connect_autoscaleserver=1
+                sed -i "/Deny from All/d" /etc/httpd/conf.d/wordpress.conf
+                sed -i "s/Require local/Require all granted/" /etc/httpd/conf.d/wordpress.conf
+                sed -i s/database_name_here/$autoscaleserver_name/ /etc/wordpress/wp-config.php
+                sed -i s/username_here/$autoscaleserver_user/ /etc/wordpress/wp-config.php
+                sed -i s/password_here/$autoscaleserver_password/ /etc/wordpress/wp-config.php
+                sed -i s/localhost/$autoscaleserver_host/ /etc/wordpress/wp-config.php
+
+                systemctl restart httpd.service
+              params:
+                $autoscaleserver_name: {get_param: database_name}
+                $autoscaleserver_user: {get_param: database_user}
+                $autoscaleserver_password: {get_attr: [database_password, value]}
+                $autoscaleserver_host: {get_attr: [autoscaleserver, first_address]}
+  web_server_scaleup_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: web_server_group}
+      cooldown: 60
+      scaling_adjustment: 1
+  web_server_scaledown_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: web_server_group}
+      cooldown: 60
+      scaling_adjustment: -1
+  cpu_alarm_high:
+    type: OS::Ceilometer::Alarm
+    properties:
+      description: Scale-up if the average CPU > 10% for 30 seconds
+      meter_name: cpu_util
+      statistic: avg
+      period: 60
+      evaluation_periods: 1
+      threshold: 30
+      alarm_actions:
+        - {get_attr: [web_server_scaleup_policy, alarm_url]}
       matching_metadata: {'metadata.user_metadata.stack': {get_param: "OS::stack_id"}}
       comparison_operator: gt
   cpu_alarm_low:
