@@ -1,0 +1,216 @@
+heat_template_version: 2013-05-23
+description: Volume AutoScaling Wordpress
+parameters:
+  image:
+    type: string
+    description: Image used for servers
+  key_name:
+    type: string
+    description: SSH key to connect to the servers
+  flavor:
+    type: string
+    description: flavor used by the web servers
+  autoscaleserver_flavor:
+    type: string
+    description: flavor used by the autoscaleserver server
+  subnet_id:
+    type: string
+    description: subnet on which the load balancer will be located
+  database_name:
+    type: string
+    description: Name of the wordpress DB
+    default: wordpress
+  database_user:
+    type: string
+    description: Name of the wordpress user
+    default: wordpress
+  availability_zone:
+    type: string
+    description: The Availability Zone to launch the instance.
+    default: nova
+  volume_size:
+    type: number
+    description: Size of the volume to be created.
+    default: 1
+    constraints:
+      - range: { min: 1, max: 1024 }
+        description: must be between 1 and 1024 Gb.
+resources:
+  database_password:
+    type: OS::Heat::RandomString
+  database_root_password:
+    type: OS::Heat::RandomString
+  autoscaleserver:
+    type: OS::Nova::Server
+    properties:
+      availability_zone: { get_param: availability_zone }
+      flavor: {get_param: autoscaleserver_flavor}
+      image: {get_param: image}
+      key_name: {get_param: key_name }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash -v
+            yum -y install mariadb mariadb-server
+            systemctl enable mariadb.service
+            systemctl start mariadb.service
+            mysqladmin -u root password $autoscaleserver_rootpassword
+            cat << EOF | mysql -u root --password=$autoscaleserver_rootpassword
+            CREATE DATABASE $autoscaleserver_name;
+            GRANT ALL PRIVILEGES ON $autoscaleserver_name.* TO "$autoscaleserver_user"@"%"
+            IDENTIFIED BY "$autoscaleserver_password";
+            FLUSH PRIVILEGES;
+            EXIT
+            EOF
+          params:
+            $autoscaleserver_rootpassword: {get_attr: [database_root_password, value]}
+            $autoscaleserver_name: {get_param: database_name}
+            $autoscaleserver_user: {get_param: database_user}
+            $autoscaleserver_password: {get_attr: [database_password, value]}
+  cinder_volume:
+    type: OS::Cinder::Volume
+    properties:
+      size: { get_param: volume_size }
+      availability_zone: { get_param: availability_zone }
+  volume_attachment:
+    type: OS::Cinder::VolumeAttachment
+    properties:
+      volume_id: { get_resource: cinder_volume }
+  database_root_password:
+    type: OS::Heat::RandomString
+  autoscaleserver:
+    type: OS::Nova::Server
+    properties:
+      availability_zone: { get_param: availability_zone }
+      flavor: {get_param: autoscaleserver_flavor}
+      image: {get_param: image}
+      key_name: {get_param: key_name }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash -v
+            yum -y install mariadb mariadb-server
+            systemctl enable mariadb.service
+            systemctl start mariadb.service
+            mysqladmin -u root password $autoscaleserver_rootpassword
+            cat << EOF | mysql -u root --password=$autoscaleserver_rootpassword
+            CREATE DATABASE $autoscaleserver_name;
+            GRANT ALL PRIVILEGES ON $autoscaleserver_name.* TO "$autoscaleserver_user"@"%"
+            IDENTIFIED BY "$autoscaleserver_password";
+            FLUSH PRIVILEGES;
+            EXIT
+            EOF
+          params:
+            $autoscaleserver_rootpassword: {get_attr: [database_root_password, value]}
+            $autoscaleserver_name: {get_param: database_name}
+            $autoscaleserver_user: {get_param: database_user}
+            $autoscaleserver_password: {get_attr: [database_password, value]}
+  cinder_volume:
+    type: OS::Cinder::Volume
+    properties:
+      size: { get_param: volume_size }
+      availability_zone: { get_param: availability_zone }
+  volume_attachment:
+    type: OS::Cinder::VolumeAttachment
+    properties:
+      volume_id: { get_resource: cinder_volume }
+      instance_uuid: { get_resource: autoscaleserver }
+      mountpoint: /dev/vdb
+  web_server_group:
+    type: OS::Heat::AutoScalingGroup
+    properties:
+      min_size: 1
+      max_size: 3
+      resource:
+        type: vollb_server.yaml
+        properties:
+          flavor: {get_param: flavor}
+          image: {get_param: image}
+          key_name: {get_param: key_name}
+          pool_id: {get_resource: pool}
+          metadata: {"metering.stack": {get_param: "OS::stack_id"}}
+          user_data:
+            str_replace:
+              template: |
+                #!/bin/bash -v
+                yum -y install httpd wordpress
+                systemctl enable httpd.service
+                systemctl start httpd.service
+                setsebool -P httpd_can_network_connect_autoscaleserver=1
+
+                sed -i "/Deny from All/d" /etc/httpd/conf.d/wordpress.conf
+                sed -i "s/Require local/Require all granted/" /etc/httpd/conf.d/wordpress.conf
+                sed -i s/database_name_here/$autoscaleserver_name/ /etc/wordpress/wp-config.php
+                sed -i s/username_here/$autoscaleserver_user/ /etc/wordpress/wp-config.php
+                sed -i s/password_here/$autoscaleserver_password/ /etc/wordpress/wp-config.php
+                sed -i s/localhost/$autoscaleserver_host/ /etc/wordpress/wp-config.php
+
+                systemctl restart httpd.service
+              params:
+                $autoscaleserver_name: {get_param: database_name}
+                $autoscaleserver_user: {get_param: database_user}
+                $autoscaleserver_password: {get_attr: [database_password, value]}
+                $autoscaleserver_host: {get_attr: [autoscaleserver, first_address]}
+  web_server_scaleup_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: web_server_group}
+      cooldown: 60
+      scaling_adjustment: 1
+  web_server_scaledown_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: web_server_group}
+      cooldown: 60
+      scaling_adjustment: -1
+  cpu_alarm_high:
+    type: OS::Ceilometer::Alarm
+    properties:
+      description: Scale-up if the average CPU > 10% for 30 seconds
+      meter_name: cpu_util
+      statistic: avg
+      period: 60
+      evaluation_periods: 1
+      threshold: 10
+      alarm_actions:
+        - {get_attr: [web_server_scaleup_policy, alarm_url]}
+      matching_metadata: {'metadata.user_metadata.stack': {get_param: "OS::stack_id"}}
+      comparison_operator: gt
+  cpu_alarm_low:
+    type: OS::Ceilometer::Alarm
+    properties:
+      description: Scale-down if the average CPU < 3% for 30 seconds
+      meter_name: cpu_util
+      statistic: avg
+      period: 600
+      evaluation_periods: 1
+      threshold: 3
+      alarm_actions:
+        - {get_attr: [web_server_scaledown_policy, alarm_url]}
+      matching_metadata: {'metadata.user_metadata.stack': {get_param: "OS::stack_id"}}
+      comparison_operator: lt
+  monitor:
+    type: OS::Neutron::HealthMonitor
+    properties:
+      type: TCP
+      delay: 3
+      max_retries: 5
+      timeout: 5
+  pool:
+    type: OS::Neutron::Pool
+    properties:
+      protocol: HTTP
+      monitors: [{get_resource: monitor}]
+      subnet_id: {get_param: subnet_id}
+      lb_method: ROUND_ROBIN
+      vip:
+        protocol_port: 80
+  lb:
+    type: OS::Neutron::LoadBalancer
+    properties:
+      protocol_port: 80
+      pool_id: {get_resource: pool}
